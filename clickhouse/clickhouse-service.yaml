@@ -1,0 +1,26 @@
+# NodePort Service for external access to ClickHouse HTTP and native interfaces.
+# The ClickHouse Inc operator creates a ClusterIP service named 'clickhouse'.
+# This manifest creates a separate NodePort for tooling (CloudBeaver, DBeaver, etc.)
+# http://<node-ip>:30123  → ClickHouse HTTP (queries, UI)
+# <node-ip>:30900        → ClickHouse native protocol (high-performance clients)
+apiVersion: v1
+kind: Service
+metadata:
+  name: clickhouse-nodeport
+  namespace: clickhouse
+  labels:
+    app: clickhouse
+spec:
+  type: NodePort
+  selector:
+    # Label set by official ClickHouse Inc operator on server pods
+    clickhouse.com/role: clickhouse-server
+  ports:
+    - name: http
+      port: 8123
+      targetPort: 8123
+      nodePort: 30123
+    - name: native
+      port: 9000
+      targetPort: 9000
+      nodePort: 30900

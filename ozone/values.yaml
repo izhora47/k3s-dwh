@@ -1,0 +1,74 @@
+# Apache Ozone Helm values for k3s single-node cluster
+# Chart: ozone/ozone (v0.2.0, app v2.0.0)
+
+# Common env vars for all Ozone components (single-node config)
+env:
+  - name: "OZONE-SITE.XML_hdds.scm.safemode.min.datanode"
+    value: "1"
+  - name: "OZONE-SITE.XML_ozone.replication"
+    value: "1"
+  - name: "OZONE-SITE.XML_ozone.scm.pipeline.creation.auto.factor.one"
+    value: "true"
+  - name: "OZONE-SITE.XML_ozone.datanode.pipeline.limit"
+    value: "1"
+
+# Single-node k3s: 1 replica each
+datanode:
+  replicas: 1
+  persistence:
+    enabled: true
+    size: 10Gi
+    storageClassName: local-path
+  resources:
+    requests:
+      memory: 256Mi
+      cpu: 100m
+    limits:
+      memory: 1Gi
+      cpu: "1"
+
+om:
+  replicas: 1
+  persistence:
+    enabled: true
+    size: 5Gi
+    storageClassName: local-path
+  service:
+    type: ClusterIP
+    port: 9874
+  resources:
+    requests:
+      memory: 256Mi
+      cpu: 100m
+    limits:
+      memory: 1Gi
+      cpu: "1"
+
+scm:
+  replicas: 1
+  persistence:
+    enabled: true
+    size: 5Gi
+    storageClassName: local-path
+  resources:
+    requests:
+      memory: 256Mi
+      cpu: 100m
+    limits:
+      memory: 1Gi
+      cpu: "1"
+
+s3g:
+  replicas: 1
+  service:
+    rest:
+      type: NodePort
+      port: 9878
+      nodePort: 30878
+  resources:
+    requests:
+      memory: 128Mi
+      cpu: 100m
+    limits:
+      memory: 512Mi
+      cpu: 500m

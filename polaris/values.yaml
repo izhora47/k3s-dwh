@@ -1,0 +1,103 @@
+# Apache Polaris Helm values for k3s single-node cluster
+# Chart: polaris/polaris (1.3.0-incubating)
+# Backend: CNPG PostgreSQL (polaris-pg in dwh namespace)
+# Storage: FILE (no S3/Ozone — resource-constrained cluster)
+
+image:
+  repository: apache/polaris
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+# NodePort service for external access
+service:
+  type: NodePort
+  ports:
+    - name: polaris-http
+      port: 8181
+      nodePort: 30181
+
+# Persistence: PostgreSQL via CNPG
+persistence:
+  type: relational-jdbc
+  relationalJdbc:
+    secret:
+      name: polaris-persistence
+      username: username
+      password: password
+      jdbcUrl: jdbcUrl
+
+# Authentication: internal with RSA token broker
+authentication:
+  type: internal
+  tokenBroker:
+    type: rsa-key-pair
+    secret:
+      name: polaris-token-broker
+
+# Realm configuration
+realmContext:
+  type: default
+  realms:
+    - POLARIS
+
+# Advanced config
+advancedConfig:
+  # Trino 480 dropped iceberg.rest-catalog.additional-header.* support.
+  # With require-header=false, Polaris defaults to the first configured realm
+  # (POLARIS) when the header is absent. Safe since we only have one realm.
+  polaris.realm-context.require-header: "false"
+  polaris.readiness.ignore-severe-issues: "true"
+
+# Storage: FILE + S3 (Ozone S3-compatible gateway)
+features:
+  SUPPORTED_CATALOG_STORAGE_TYPES:
+    - FILE
+    - S3
+  ALLOW_INSECURE_STORAGE_TYPES: true
+
+# S3/Ozone endpoint and credentials for catalog storage
+# Ozone S3G in non-secure mode accepts any credentials
+extraEnv:
+  - name: AWS_ACCESS_KEY_ID
+    valueFrom:
+      secretKeyRef:
+        name: ozone-s3-creds
+        key: access-key
+        optional: true
+  - name: AWS_SECRET_ACCESS_KEY
+    valueFrom:
+      secretKeyRef:
+        name: ozone-s3-creds
+        key: secret-key
+        optional: true
+  - name: AWS_REGION
+    value: "us-east-1"
+  # Route Polaris S3FileIO calls to Ozone S3 Gateway instead of real AWS.
+  # AWS SDK v2 honours AWS_ENDPOINT_URL_S3 for per-service endpoint override.
+  - name: AWS_ENDPOINT_URL_S3
+    value: "http://ozone-s3g-rest.dwh.svc.cluster.local:9878"
+  # Disable STS (no Kerberos security on Ozone in dev mode)
+  - name: AWS_EC2_METADATA_DISABLED
+    value: "true"
+
+# Logging
+logging:
+  level: INFO
+  console:
+    enabled: true
+    json: false
+
+# Resources for k3s
+resources:
+  requests:
+    memory: 256Mi
+    cpu: 100m
+  limits:
+    memory: 1Gi
+    cpu: "1"
+
+# Disable service monitor (no Prometheus)
+serviceMonitor:
+  enabled: false

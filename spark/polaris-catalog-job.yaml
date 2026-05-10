@@ -1,0 +1,205 @@
+# SparkApplication: Classic Spark job — list Polaris catalogs and show table data
+#
+# Uses urllib (stdlib) for Polaris REST calls — no pip install required.
+# PySpark reads from the result and creates an in-memory DataFrame.
+#
+# Usage:
+#   kubectl apply -f spark/polaris-catalog-job.yaml
+#   kubectl logs -n dwh -l spark-role=driver -f
+#   kubectl delete sparkapplication polaris-catalog-job -n dwh
+#   kubectl delete configmap spark-polaris-script -n dwh
+apiVersion: spark.apache.org/v1
+kind: SparkApplication
+metadata:
+  name: polaris-catalog-job
+  namespace: dwh
+spec:
+  pyFiles: "local:///app/polaris_catalog.py"
+  runtimeVersions:
+    sparkVersion: "4.1.1"
+  sparkConf:
+    "spark.kubernetes.authenticate.driver.serviceAccountName": "spark"
+    "spark.kubernetes.namespace": "dwh"
+    "spark.kubernetes.container.image": "apache/spark:4.1.1-python3"
+    "spark.pyspark.python": "python3"
+    "spark.kubernetes.executor.podNamePrefix": "polaris-catalog"
+    "spark.executor.instances": "1"
+    "spark.kubernetes.executor.request.cores": "500m"
+    "spark.kubernetes.driver.request.cores": "500m"
+  applicationTolerations:
+    resourceRetainPolicy: OnFailure
+    ttlAfterStopMillis: 60000
+  driverSpec:
+    podTemplateSpec:
+      spec:
+        # ConfigMap is read-only; Spark deletes pyFiles from work-dir after staging.
+        # initContainer copies the script to a writable emptyDir first.
+        initContainers:
+          - name: copy-script
+            image: busybox:1.36
+            command: [sh, -c, "cp /cm/polaris_catalog.py /app/polaris_catalog.py && chmod 644 /app/polaris_catalog.py"]
+            volumeMounts:
+              - name: script-cm
+                mountPath: /cm
+              - name: appdir
+                mountPath: /app
+        volumes:
+          - name: script-cm
+            configMap:
+              name: spark-polaris-script
+          - name: appdir
+            emptyDir: {}
+        containers:
+          - name: spark-kubernetes-driver
+            volumeMounts:
+              - name: appdir
+                mountPath: /app
+            env:
+              - name: POLARIS_URI
+                value: "http://polaris.dwh.svc.cluster.local:8181/api/catalog"
+              - name: POLARIS_CLIENT_ID
+                value: "root"
+              - name: POLARIS_CLIENT_SECRET
+                value: "s3cr3t"
+              - name: POLARIS_REALM
+                value: "POLARIS"
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spark-polaris-script
+  namespace: dwh
+data:
+  polaris_catalog.py: |
+    #!/usr/bin/env python3
+    """
+    Classic Spark job: connect to Apache Polaris REST catalog via urllib (stdlib),
+    list all catalogs / namespaces / tables, then build Spark DataFrames from
+    the catalog metadata.
+    No pip install required — only stdlib + PySpark (bundled in image).
+    """
+    import os, sys, json
+    import urllib.request
+    import urllib.parse
+    from pyspark.sql import SparkSession
+    from pyspark.sql.types import StructType, StructField, StringType, IntegerType
+
+    POLARIS_URI   = os.getenv("POLARIS_URI",   "http://polaris.dwh.svc.cluster.local:8181/api/catalog")
+    CLIENT_ID     = os.getenv("POLARIS_CLIENT_ID",     "root")
+    CLIENT_SECRET = os.getenv("POLARIS_CLIENT_SECRET", "s3cr3t")
+    REALM         = os.getenv("POLARIS_REALM",         "POLARIS")
+    MGMT_URL      = POLARIS_URI.replace("/api/catalog", "/api/management")
+
+    SEP = "=" * 60
+
+    def http_get(url, headers):
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+
+    def http_get_safe(url, headers):
+        """Return parsed JSON or None on any HTTP/network error."""
+        try:
+            return http_get(url, headers)
+        except Exception as e:
+            print(f"    [WARN] {url} → {e}")
+            return None
+
+    def http_post(url, headers, data):
+        body = urllib.parse.urlencode(data).encode()
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+
+    # ── 1. Authenticate ──────────────────────────────────────────────────────
+    print(f"\n{SEP}\nPolaris Catalog Explorer  (Classic SparkApplication)\n{SEP}")
+
+    tok = http_post(
+        f"{POLARIS_URI}/v1/oauth/tokens",
+        {"Polaris-Realm": REALM, "Content-Type": "application/x-www-form-urlencoded"},
+        {"grant_type": "client_credentials", "client_id": CLIENT_ID,
+         "client_secret": CLIENT_SECRET, "scope": "PRINCIPAL_ROLE:ALL"},
+    )
+    token = tok["access_token"]
+    print(f"Authenticated as '{CLIENT_ID}' in realm '{REALM}'")
+
+    hdrs = {"Authorization": f"Bearer {token}", "Polaris-Realm": REALM}
+
+    # ── 2. List catalogs (Management API) ────────────────────────────────────
+    catalogs = http_get(f"{MGMT_URL}/v1/catalogs", hdrs).get("catalogs", [])
+    print(f"\nCatalogs ({len(catalogs)}):")
+    catalog_rows = []
+    for c in catalogs:
+        si    = c["storageConfigInfo"]
+        loc   = c["properties"].get("default-base-location", "-")
+        stype = si.get("storageType", "-")
+        print(f"  [{c['name']}]  type={c['type']}  storage={stype}  location={loc}")
+        catalog_rows.append((c["name"], c["type"], stype, loc))
+
+    # ── 3. Namespaces + tables ────────────────────────────────────────────────
+    # Note: load_table (GET /namespaces/.../tables/{tbl}) requires S3 to be
+    # accessible to validate the metadata file location. We catch errors so
+    # the job succeeds even when Ozone is offline.
+    table_rows = []
+    for cat in catalogs:
+        cname = cat["name"]
+        ns_data = http_get(f"{POLARIS_URI}/v1/{cname}/namespaces", hdrs)
+        namespaces = ns_data.get("namespaces", [])
+        print(f"\nCatalog '{cname}' — {len(namespaces)} namespace(s):")
+        for ns_parts in namespaces:
+            ns     = ".".join(ns_parts)
+            t_data = http_get(f"{POLARIS_URI}/v1/{cname}/namespaces/{ns}/tables", hdrs)
+            tables = [t["name"] for t in t_data.get("identifiers", [])]
+            print(f"  [{ns}]  tables: {tables or '(empty)'}")
+            for tbl in tables:
+                meta_resp = http_get_safe(
+                    f"{POLARIS_URI}/v1/{cname}/namespaces/{ns}/tables/{tbl}", hdrs
+                )
+                if meta_resp:
+                    meta   = meta_resp.get("metadata", {})
+                    fields = [f["name"] for f in
+                              meta.get("schemas", [{}])[0].get("fields", [])]
+                    snaps  = len(meta.get("snapshots", []))
+                    loc    = meta.get("location", "-")
+                    print(f"    '{tbl}': columns={fields}  snapshots={snaps}")
+                    table_rows.append((cname, ns, tbl, len(fields), snaps, loc))
+                else:
+                    print(f"    '{tbl}': (metadata unavailable — S3 offline?)")
+                    table_rows.append((cname, ns, tbl, None, None, "-"))
+
+    # ── 4. Spark: turn catalog metadata into DataFrames ──────────────────────
+    print(f"\n{'-'*60}\nSpark DataFrames from catalog metadata\n{'-'*60}")
+
+    spark = SparkSession.builder.appName("PolarisExplorer").getOrCreate()
+    spark.sparkContext.setLogLevel("WARN")
+
+    cat_schema = StructType([
+        StructField("catalog",  StringType(), False),
+        StructField("type",     StringType(), False),
+        StructField("storage",  StringType(), False),
+        StructField("location", StringType(), True),
+    ])
+    tbl_schema = StructType([
+        StructField("catalog",   StringType(), False),
+        StructField("namespace", StringType(), False),
+        StructField("table",     StringType(), False),
+        StructField("columns",   IntegerType(), True),
+        StructField("snapshots", IntegerType(), True),
+        StructField("location",  StringType(), True),
+    ])
+
+    df_cats = spark.createDataFrame(catalog_rows, schema=cat_schema)
+    df_tbls = spark.createDataFrame(table_rows,   schema=tbl_schema)
+
+    print("\nCatalog inventory:")
+    df_cats.show(truncate=False)
+
+    print("Table inventory:")
+    df_tbls.show(truncate=False)
+
+    print(f"Total catalogs: {df_cats.count()}")
+    print(f"Total tables  : {df_tbls.count()}")
+
+    spark.stop()
+    print(f"\n{SEP}\nJob COMPLETED successfully.\n{SEP}")

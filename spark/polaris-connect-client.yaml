@@ -1,0 +1,215 @@
+# Kubernetes Job: Spark Connect client — list Polaris catalogs via sc://
+#
+# Requires spark-connect-server to be running first.
+# Uses apache/spark:4.1.1-python3 (PySpark pre-installed) and pip installs
+# only the small Spark Connect gRPC dependencies.
+# Connects to the Spark Connect server and calls Polaris REST API.
+#
+# Usage:
+#   kubectl apply -f spark/polaris-connect-server.yaml   # start server first
+#   kubectl wait sparkapplication spark-connect-server -n dwh \
+#     --for=jsonpath='{.status.currentState.currentStateSummary}'=RunningHealthy \
+#     --timeout=3m
+#   kubectl apply -f spark/polaris-connect-client.yaml
+#   kubectl logs -n dwh job/polaris-connect-client -f
+#   kubectl delete job polaris-connect-client -n dwh
+#   kubectl delete configmap spark-connect-client-script -n dwh
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: polaris-connect-client
+  namespace: dwh
+spec:
+  ttlSecondsAfterFinished: 300
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      initContainers:
+        - name: wait-for-connect
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              echo "Waiting for Spark Connect server on port 15002..."
+              until nc -z spark-connect-server-svc.dwh.svc.cluster.local 15002; do
+                sleep 3
+              done
+              echo "Spark Connect server is ready."
+      containers:
+        - name: client
+          image: apache/spark:4.1.1-python3
+          command:
+            - sh
+            - -c
+            - |
+              echo "Installing Spark Connect gRPC dependencies..."
+              pip install --quiet --timeout 120 grpcio grpcio-status googleapis-common-protos pandas pyarrow
+              echo "Running Spark Connect client..."
+              PYTHONPATH=/opt/spark/python:/opt/spark/python/lib/$(ls /opt/spark/python/lib | grep py4j) \
+                python3 /scripts/polaris_connect_client.py
+          env:
+            - name: POLARIS_URI
+              value: "http://polaris.dwh.svc.cluster.local:8181/api/catalog"
+            - name: POLARIS_CLIENT_ID
+              value: "root"
+            - name: POLARIS_CLIENT_SECRET
+              value: "s3cr3t"
+            - name: POLARIS_REALM
+              value: "POLARIS"
+            - name: SPARK_CONNECT_URL
+              value: "sc://spark-connect-server-svc.dwh.svc.cluster.local:15002"
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+          resources:
+            requests:
+              memory: 256Mi
+              cpu: 100m
+            limits:
+              memory: 1Gi
+              cpu: "1"
+      volumes:
+        - name: scripts
+          configMap:
+            name: spark-connect-client-script
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spark-connect-client-script
+  namespace: dwh
+data:
+  polaris_connect_client.py: |
+    #!/usr/bin/env python3
+    """
+    Spark Connect client: connects to a remote Spark Connect server (sc://)
+    then calls Polaris REST API to discover catalogs/namespaces/tables,
+    and demonstrates Spark remote execution.
+    """
+    import os, sys, json
+    import urllib.request
+    import urllib.parse
+    from pyspark.sql import SparkSession
+    from pyspark.sql.types import StructType, StructField, StringType, IntegerType
+
+    POLARIS_URI   = os.getenv("POLARIS_URI",   "http://polaris.dwh.svc.cluster.local:8181/api/catalog")
+    CLIENT_ID     = os.getenv("POLARIS_CLIENT_ID",     "root")
+    CLIENT_SECRET = os.getenv("POLARIS_CLIENT_SECRET", "s3cr3t")
+    REALM         = os.getenv("POLARIS_REALM",         "POLARIS")
+    CONNECT_URL   = os.getenv("SPARK_CONNECT_URL",
+                              "sc://spark-connect-server-svc.dwh.svc.cluster.local:15002")
+    MGMT_URL      = POLARIS_URI.replace("/api/catalog", "/api/management")
+
+    SEP = "=" * 60
+
+    def http_get(url, headers):
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+
+    def http_post(url, headers, data):
+        body = urllib.parse.urlencode(data).encode()
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+
+    # ── 1. Connect to Spark Connect server ───────────────────────────────────
+    print(f"\n{SEP}\nPolaris Catalog Explorer  (Spark Connect client)\n{SEP}")
+    print(f"Connecting to Spark Connect at: {CONNECT_URL}")
+
+    spark = SparkSession.builder \
+        .remote(CONNECT_URL) \
+        .appName("PolarisConnectExplorer") \
+        .getOrCreate()
+
+    print(f"Spark Connect session established.")
+    print(f"Spark version: {spark.version}")
+
+    # ── 2. Authenticate with Polaris ─────────────────────────────────────────
+    tok = http_post(
+        f"{POLARIS_URI}/v1/oauth/tokens",
+        {"Polaris-Realm": REALM, "Content-Type": "application/x-www-form-urlencoded"},
+        {"grant_type": "client_credentials", "client_id": CLIENT_ID,
+         "client_secret": CLIENT_SECRET, "scope": "PRINCIPAL_ROLE:ALL"},
+    )
+    token = tok["access_token"]
+    print(f"\nAuthenticated as '{CLIENT_ID}' in realm '{REALM}'")
+
+    hdrs = {"Authorization": f"Bearer {token}", "Polaris-Realm": REALM}
+
+    # ── 3. List catalogs ─────────────────────────────────────────────────────
+    catalogs = http_get(f"{MGMT_URL}/v1/catalogs", hdrs).get("catalogs", [])
+    print(f"\nCatalogs ({len(catalogs)}):")
+    catalog_rows = []
+    for c in catalogs:
+        si  = c["storageConfigInfo"]
+        loc = c["properties"].get("default-base-location", "-")
+        st  = si.get("storageType", "-")
+        print(f"  [{c['name']}]  type={c['type']}  storage={st}  location={loc}")
+        catalog_rows.append((c["name"], c["type"], st, loc))
+
+    # ── 4. Namespaces + tables ────────────────────────────────────────────────
+    table_rows = []
+    for cat in catalogs:
+        cname = cat["name"]
+        namespaces = http_get(
+            f"{POLARIS_URI}/v1/{cname}/namespaces", hdrs
+        ).get("namespaces", [])
+        print(f"\nCatalog '{cname}' — {len(namespaces)} namespace(s):")
+        for ns_parts in namespaces:
+            ns     = ".".join(ns_parts)
+            tables = [t["name"] for t in http_get(
+                f"{POLARIS_URI}/v1/{cname}/namespaces/{ns}/tables", hdrs
+            ).get("identifiers", [])]
+            print(f"  [{ns}]  tables: {tables or '(empty)'}")
+            for tbl in tables:
+                meta   = http_get(
+                    f"{POLARIS_URI}/v1/{cname}/namespaces/{ns}/tables/{tbl}", hdrs
+                ).get("metadata", {})
+                fields = [f["name"] for f in
+                          meta.get("schemas", [{}])[0].get("fields", [])]
+                snaps  = len(meta.get("snapshots", []))
+                loc    = meta.get("location", "-")
+                print(f"    '{tbl}': columns={fields}  snapshots={snaps}")
+                table_rows.append((cname, ns, tbl, len(fields), snaps, loc))
+
+    # ── 5. Spark Connect: execute DataFrames on the remote cluster ───────────
+    print(f"\n{'-'*60}\nSpark Connect: remote DataFrame execution\n{'-'*60}")
+
+    cat_schema = StructType([
+        StructField("catalog",  StringType(), False),
+        StructField("type",     StringType(), False),
+        StructField("storage",  StringType(), False),
+        StructField("location", StringType(), True),
+    ])
+    tbl_schema = StructType([
+        StructField("catalog",   StringType(), False),
+        StructField("namespace", StringType(), False),
+        StructField("table",     StringType(), False),
+        StructField("columns",   IntegerType(), True),
+        StructField("snapshots", IntegerType(), True),
+        StructField("location",  StringType(), True),
+    ])
+
+    # These DataFrames execute on the REMOTE Spark cluster (not the client)
+    df_cats = spark.createDataFrame(catalog_rows, schema=cat_schema)
+    df_tbls = spark.createDataFrame(table_rows,   schema=tbl_schema)
+
+    print(f"\nCatalog inventory (executed on Spark cluster at {CONNECT_URL}):")
+    df_cats.show(truncate=False)
+
+    print("Table inventory:")
+    df_tbls.show(truncate=False)
+
+    print(f"Catalogs (remote count): {df_cats.count()}")
+    print(f"Tables   (remote count): {df_tbls.count()}")
+
+    # Show Spark cluster info via SQL
+    print("\nSpark SQL (remote):")
+    spark.sql("SELECT current_timestamp() AS ts, spark_version() AS version").show()
+
+    spark.stop()
+    print(f"\n{SEP}\nSpark Connect job COMPLETED successfully.\n{SEP}")

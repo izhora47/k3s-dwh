@@ -1,0 +1,135 @@
+# Trino Helm values for k3s single-node data lakehouse
+# Chart: trino/trino (1.42.2, app version 480)
+# Connects to: Polaris REST catalog (Iceberg) + Ozone S3 storage
+# Namespace: dwh (co-located with Polaris and Ozone)
+
+image:
+  tag: "480"
+  pullPolicy: IfNotPresent
+
+server:
+  # k3s single-node: 1 worker. Production: match CPU/memory budget
+  workers: 1
+  node:
+    environment: production
+    dataDir: /data/trino
+  log:
+    trino:
+      level: INFO
+
+  config:
+    query:
+      maxMemory: "700MB"
+
+  exchangeManager:
+    name: filesystem
+    baseDir: /tmp/trino-exchange
+
+  autoscaling:
+    enabled: false
+
+# JVM settings for coordinator
+coordinator:
+  jvm:
+    maxHeapSize: "1G"
+    gcMethod:
+      type: UseG1GC
+      g1:
+        heapRegionSize: "32M"
+  config:
+    query:
+      # Must be < 70% of JVM heap (1G × 0.7 = 700MB; leaves 30% headroom)
+      maxMemoryPerNode: "700MB"
+  resources:
+    requests:
+      memory: 512Mi
+      cpu: 200m
+    limits:
+      memory: 1536Mi
+      cpu: "1"
+
+
+# JVM settings for worker
+worker:
+  jvm:
+    maxHeapSize: "1G"
+    gcMethod:
+      type: UseG1GC
+      g1:
+        heapRegionSize: "32M"
+  config:
+    query:
+      maxMemoryPerNode: "700MB"
+  resources:
+    requests:
+      memory: 512Mi
+      cpu: 200m
+    limits:
+      memory: 1536Mi
+      cpu: "1"
+
+# Catalogs
+catalogs:
+  # TPC-H benchmark data — always available, no storage needed
+  tpch: |
+    connector.name=tpch
+    tpch.splits-per-node=4
+
+  # TPC-DS benchmark data
+  tpcds: |
+    connector.name=tpcds
+    tpcds.splits-per-node=4
+
+  # Apache Iceberg via Polaris REST catalog + Ozone S3 storage
+  # Trino 480 property names (differ from older versions):
+  #   oauth2.credential replaces oauth2.client-id + oauth2.client-secret
+  #   oauth2.server-uri replaces oauth2.token-endpoint
+  #   s3.aws-access-key replaces s3.access-key
+  #   s3.aws-secret-key replaces s3.secret-key
+  #   additional-header.* removed — Polaris configured with require-header=false
+  lakehouse: |
+    connector.name=iceberg
+    iceberg.catalog.type=rest
+    iceberg.rest-catalog.uri=http://polaris.dwh.svc.cluster.local:8181/api/catalog
+    iceberg.rest-catalog.warehouse=lakehouse
+    iceberg.rest-catalog.security=oauth2
+    iceberg.rest-catalog.oauth2.credential=root:s3cr3t
+    iceberg.rest-catalog.oauth2.server-uri=http://polaris.dwh.svc.cluster.local:8181/api/catalog/v1/oauth/tokens
+    iceberg.rest-catalog.oauth2.scope=PRINCIPAL_ROLE:ALL
+    fs.native-s3.enabled=true
+    s3.endpoint=http://ozone-s3g-rest.dwh.svc.cluster.local:9878
+    s3.path-style-access=true
+    s3.region=us-east-1
+    s3.aws-access-key=${ENV:AWS_ACCESS_KEY_ID}
+    s3.aws-secret-key=${ENV:AWS_SECRET_ACCESS_KEY}
+
+
+# Ozone S3 credentials injected into all pods (coordinator + workers)
+# Chart uses top-level `env`, not coordinator/worker.extraEnv
+env:
+  - name: AWS_ACCESS_KEY_ID
+    valueFrom:
+      secretKeyRef:
+        name: ozone-s3-creds
+        key: access-key
+        optional: true
+  - name: AWS_SECRET_ACCESS_KEY
+    valueFrom:
+      secretKeyRef:
+        name: ozone-s3-creds
+        key: secret-key
+        optional: true
+
+# NodePort for external Trino UI + JDBC access
+# Chart uses top-level service:, not coordinator.service:
+service:
+  type: NodePort
+  port: 8080
+  nodePort: 30880
+
+serviceAccount:
+  create: true
+  name: trino
+
+ingress:
+  enabled: false

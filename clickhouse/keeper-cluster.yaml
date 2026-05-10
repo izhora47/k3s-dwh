@@ -1,0 +1,41 @@
+# KeeperCluster — ClickHouse Keeper coordination service
+# Replaces ZooKeeper for ClickHouse cluster coordination.
+# Official ClickHouse Inc operator v0.0.4 CRD schema:
+#   - No spec.version field — version is set via spec.upgradeChannel
+#   - spec.settings uses structured fields (logger, extraConfig), not free-form map
+# Production: replicas: 3 (odd number for quorum)
+# k3s single-node: replicas: 1 (no HA)
+apiVersion: clickhouse.com/v1alpha1
+kind: KeeperCluster
+metadata:
+  name: clickhouse-keeper
+  namespace: clickhouse
+spec:
+  # Version pin via channel: "stable", "lts", or "25.8"
+  upgradeChannel: "25.8"
+
+  # Production: 3. Single-node k3s: 1
+  replicas: 1
+
+  # Persistent storage for Keeper logs and snapshots
+  dataVolumeClaimSpec:
+    accessModes:
+      - ReadWriteOnce
+    resources:
+      requests:
+        storage: 5Gi
+    storageClassName: local-path
+
+  # Container resources
+  containerTemplate:
+    resources:
+      requests:
+        memory: 256Mi
+        cpu: 100m
+      limits:
+        memory: 1Gi
+        cpu: "1"
+
+  settings:
+    logger:
+      level: information

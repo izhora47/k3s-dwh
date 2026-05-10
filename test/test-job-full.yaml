@@ -1,0 +1,80 @@
+# Full lakehouse integration test Job
+# Tests: Polaris REST + Ozone S3 + Trino Iceberg (create/insert/select/update/drop)
+# Requires: Trino + Ozone + Polaris all deployed and healthy
+#
+# Usage:
+#   # Create ConfigMap from test script
+#   kubectl create configmap lakehouse-test-script \
+#     --from-file=test_lakehouse_full.py=test/test_lakehouse_full.py \
+#     -n dwh --dry-run=client -o yaml | kubectl apply -f -
+#
+#   # Run the test job
+#   kubectl apply -f test/test-job-full.yaml
+#   kubectl wait job lakehouse-test-full -n dwh --for=condition=Complete --timeout=10m
+#   kubectl logs -n dwh -l job-name=lakehouse-test-full
+#   kubectl delete job lakehouse-test-full -n dwh
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lakehouse-test-full
+  namespace: dwh
+spec:
+  ttlSecondsAfterFinished: 600
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      initContainers:
+        - name: copy-script
+          image: busybox:1.36
+          command: ["cp", "/scripts/test_lakehouse_full.py", "/work/test_lakehouse_full.py"]
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+            - name: work
+              mountPath: /work
+      containers:
+        - name: test
+          image: trinodb/trino:480
+          command: ["python3", "/work/test_lakehouse_full.py"]
+          env:
+            - name: POLARIS_URL
+              value: "http://polaris.dwh.svc.cluster.local:8181"
+            - name: TRINO_URL
+              value: "http://trino.dwh.svc.cluster.local:8080"
+            - name: OZONE_S3_URL
+              value: "http://ozone-s3g-rest.dwh.svc.cluster.local:9878"
+            - name: POLARIS_REALM
+              value: "POLARIS"
+            - name: POLARIS_CLIENT_ID
+              value: "root"
+            - name: POLARIS_CLIENT_SECRET
+              value: "s3cr3t"
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: ozone-s3-creds
+                  key: access-key
+                  optional: true
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ozone-s3-creds
+                  key: secret-key
+                  optional: true
+          volumeMounts:
+            - name: work
+              mountPath: /work
+          resources:
+            requests:
+              memory: 128Mi
+              cpu: 100m
+            limits:
+              memory: 256Mi
+              cpu: 500m
+      volumes:
+        - name: scripts
+          configMap:
+            name: lakehouse-test-script
+        - name: work
+          emptyDir: {}

@@ -1,0 +1,60 @@
+# ClickHouseCluster — ClickHouse server cluster
+# Official ClickHouse Inc operator v0.0.4 CRD schema:
+#   - No spec.version field — version is set via spec.upgradeChannel
+#   - spec.settings uses structured sub-fields; custom CH settings go in settings.extraConfig
+# Production sizing:
+#   shards: 2+      (horizontal partitioning)
+#   replicas: 2     (HA per shard, requires KeeperCluster with 3 replicas)
+# k3s single-node:
+#   shards: 1
+#   replicas: 1
+apiVersion: clickhouse.com/v1alpha1
+kind: ClickHouseCluster
+metadata:
+  name: clickhouse
+  namespace: clickhouse
+spec:
+  # Version pin via channel: "stable", "lts", or "26.4"
+  upgradeChannel: "26.4"
+
+  # Shards × replicas = total ClickHouse server pods
+  shards: 1
+  replicas: 1
+
+  # Reference to KeeperCluster for coordination (must be in same namespace)
+  keeperClusterRef:
+    name: clickhouse-keeper
+
+  # Persistent data storage
+  dataVolumeClaimSpec:
+    accessModes:
+      - ReadWriteOnce
+    resources:
+      requests:
+        storage: 20Gi
+    storageClassName: local-path
+
+  # Container resources
+  containerTemplate:
+    resources:
+      requests:
+        memory: 512Mi
+        cpu: 200m
+      limits:
+        memory: 4Gi
+        cpu: "2"
+
+  settings:
+    # Server-level settings (config.yaml)
+    extraConfig:
+      max_concurrent_queries: 100
+    # User-level settings (users.yaml, under profiles/default)
+    # network_compression_method, max_memory_usage, async_insert are user-level
+    # and must NOT appear in extraConfig or ClickHouse will refuse to start.
+    extraUsersConfig:
+      profiles:
+        default:
+          max_memory_usage: 4294967296
+          async_insert: 1
+          async_insert_threads: 4
+          network_compression_method: lz4

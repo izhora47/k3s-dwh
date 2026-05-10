@@ -1,0 +1,43 @@
+# CloudNativePG PostgreSQL cluster for Apache Polaris metadata store
+# CNPG auto-creates secrets:
+#   polaris-pg-superuser  (superuser credentials)
+#   polaris-pg-app        (app user credentials, used by Polaris)
+# Secret keys: username, password, host, port, dbname, uri
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: polaris-pg
+  namespace: dwh
+spec:
+  instances: 1
+
+  postgresql:
+    parameters:
+      max_connections: "100"
+      shared_buffers: "128MB"
+
+  bootstrap:
+    initdb:
+      database: polaris
+      owner: polaris
+
+  storage:
+    size: 5Gi
+    storageClass: local-path   # k3s default provisioner
+
+  resources:
+    requests:
+      memory: 256Mi
+      cpu: 100m
+    limits:
+      memory: 1Gi
+      cpu: "1"
+
+  # Enable connection pooling via PgBouncer (optional)
+  # managed:
+  #   services:
+  #     additional:
+  #       - selectorType: rw
+  #         serviceTemplate:
+  #           metadata:
+  #             name: polaris-pg-pooler

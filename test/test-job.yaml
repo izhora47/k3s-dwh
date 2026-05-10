@@ -1,0 +1,223 @@
+# Kubernetes Job: PyIceberg lakehouse integration test
+# Runs test: creates namespace, table, INSERTs and SELECTs data
+# via Polaris REST catalog with Ozone S3 backend.
+#
+# Usage:
+#   kubectl apply -f test/test-job.yaml
+#   kubectl logs -n dwh job/lakehouse-test -f
+#   kubectl delete job lakehouse-test -n dwh
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lakehouse-test
+  namespace: dwh
+  labels:
+    app: lakehouse-test
+spec:
+  ttlSecondsAfterFinished: 600
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        app: lakehouse-test
+    spec:
+      restartPolicy: Never
+      initContainers:
+        - name: wait-for-polaris
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              echo "Waiting for Polaris..."
+              until nc -z polaris.dwh.svc.cluster.local 8181; do sleep 3; done
+              echo "Polaris is ready."
+        - name: wait-for-ozone
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              echo "Waiting for Ozone S3 Gateway..."
+              until nc -z ozone-s3g-rest.dwh.svc.cluster.local 9878; do sleep 3; done
+              echo "Ozone S3 Gateway is ready."
+      containers:
+        - name: test
+          image: python:3.12-slim
+          command:
+            - sh
+            - -c
+            - |
+              echo "Installing dependencies..."
+              pip install --quiet "pyiceberg[s3fs]>=0.7.0" pyarrow boto3
+              echo "Running lakehouse test..."
+              python /test/test_lakehouse.py
+          env:
+            - name: POLARIS_URI
+              value: "http://polaris.dwh.svc.cluster.local:8181/api/catalog"
+            - name: POLARIS_CLIENT_ID
+              value: "root"
+            - name: POLARIS_CLIENT_SECRET
+              value: "s3cr3t"
+            - name: POLARIS_WAREHOUSE
+              value: "lakehouse"
+            - name: POLARIS_REALM
+              value: "POLARIS"
+            - name: OZONE_ENDPOINT
+              value: "http://ozone-s3g-rest.dwh.svc.cluster.local:9878"
+            - name: OZONE_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ozone-s3-creds
+                  key: access-key
+            - name: OZONE_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ozone-s3-creds
+                  key: secret-key
+            - name: OZONE_BUCKET
+              value: "lakehouse"
+                    # Force PyArrow to use small part size to avoid empty-file multipart issues with Ozone
+            - name: ARROW_S3_MIN_PART_SIZE
+              value: "5242880"
+          volumeMounts:
+            - name: test-script
+              mountPath: /test
+          resources:
+            requests:
+              memory: 256Mi
+              cpu: 200m
+            limits:
+              memory: 1Gi
+              cpu: "1"
+      volumes:
+        - name: test-script
+          configMap:
+            name: lakehouse-test-script
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lakehouse-test-script
+  namespace: dwh
+data:
+  test_lakehouse.py: |
+    #!/usr/bin/env python3
+    """
+    Polaris + Ozone Lakehouse integration test.
+    1. Connect to Polaris REST catalog
+    2. Create namespace 'bronze' (idempotent)
+    3. Create table 'bronze.orders' (idempotent)
+    4. INSERT 5 rows via PyIceberg + fsspec (avoids PyArrow multipart issues with Ozone)
+    5. SELECT all rows + filtered query
+    """
+    import os
+    import pyarrow as pa
+    from pyiceberg.catalog import load_catalog
+    from pyiceberg.exceptions import NamespaceAlreadyExistsError, TableAlreadyExistsError
+    from pyiceberg.expressions import EqualTo
+    from pyiceberg.schema import Schema
+    from pyiceberg.types import (
+        NestedField, IntegerType, StringType, FloatType,
+    )
+
+    POLARIS_URI       = os.getenv("POLARIS_URI")
+    POLARIS_CLIENT_ID = os.getenv("POLARIS_CLIENT_ID")
+    POLARIS_SECRET    = os.getenv("POLARIS_CLIENT_SECRET")
+    POLARIS_WAREHOUSE = os.getenv("POLARIS_WAREHOUSE")
+    POLARIS_REALM     = os.getenv("POLARIS_REALM", "POLARIS")
+    OZONE_ENDPOINT    = os.getenv("OZONE_ENDPOINT")
+    OZONE_ACCESS_KEY  = os.getenv("OZONE_ACCESS_KEY")
+    OZONE_SECRET_KEY  = os.getenv("OZONE_SECRET_KEY")
+
+    # fsspec I/O avoids PyArrow multipart upload issues with Ozone
+    catalog = load_catalog(POLARIS_WAREHOUSE, **{
+        "type": "rest",
+        "uri": POLARIS_URI,
+        "credential": f"{POLARIS_CLIENT_ID}:{POLARIS_SECRET}",
+        "warehouse": POLARIS_WAREHOUSE,
+        "scope": "PRINCIPAL_ROLE:ALL",
+        "header.Polaris-Realm": POLARIS_REALM,
+        "header.X-Iceberg-Access-Delegation": "",
+        "py-io-impl": "pyiceberg.io.fsspec.FsspecFileIO",
+        "s3.endpoint": OZONE_ENDPOINT,
+        "s3.access-key-id": OZONE_ACCESS_KEY,
+        "s3.secret-access-key": OZONE_SECRET_KEY,
+        "s3.region": "us-east-1",
+        "s3.path-style-access": "true",
+    })
+    print("Connected to Polaris catalog.")
+
+    # Create namespace (idempotent)
+    try:
+        catalog.create_namespace("bronze")
+        print("Namespace 'bronze' created.")
+    except NamespaceAlreadyExistsError:
+        print("Namespace 'bronze' already exists.")
+
+    # Iceberg schema for orders table
+    iceberg_schema = Schema(
+        NestedField(1, "order_id",   IntegerType(), required=True),
+        NestedField(2, "customer",   StringType(),  required=True),
+        NestedField(3, "product",    StringType(),  required=True),
+        NestedField(4, "quantity",   IntegerType(), required=True),
+        NestedField(5, "unit_price", FloatType(),   required=True),
+        NestedField(6, "total",      FloatType(),   required=True),
+        NestedField(7, "status",     StringType()),
+        NestedField(8, "region",     StringType()),
+    )
+
+    # Create table (idempotent)
+    tid = "bronze.orders"
+    try:
+        table = catalog.create_table(tid, schema=iceberg_schema)
+        print(f"Table '{tid}' created.")
+    except TableAlreadyExistsError:
+        table = catalog.load_table(tid)
+        print(f"Table '{tid}' already exists, loaded.")
+
+    # Arrow schema for data insertion
+    arrow_schema = pa.schema([
+        pa.field("order_id",   pa.int32(),   nullable=False),
+        pa.field("customer",   pa.string(),  nullable=False),
+        pa.field("product",    pa.string(),  nullable=False),
+        pa.field("quantity",   pa.int32(),   nullable=False),
+        pa.field("unit_price", pa.float32(), nullable=False),
+        pa.field("total",      pa.float32(), nullable=False),
+        pa.field("status",     pa.string()),
+        pa.field("region",     pa.string()),
+    ])
+    data = pa.table({
+        "order_id":   pa.array([1, 2, 3, 4, 5], type=pa.int32()),
+        "customer":   pa.array(["Alice", "Bob", "Charlie", "Diana", "Eve"]),
+        "product":    pa.array(["Widget", "Gadget", "Widget", "Doohickey", "Gadget"]),
+        "quantity":   pa.array([10, 5, 20, 1, 8], type=pa.int32()),
+        "unit_price": pa.array([9.99, 24.99, 9.99, 99.99, 24.99], type=pa.float32()),
+        "total":      pa.array([99.90, 124.95, 199.80, 99.99, 199.92], type=pa.float32()),
+        "status":     pa.array(["shipped", "pending", "shipped", "shipped", "pending"]),
+        "region":     pa.array(["EU", "US", "EU", "APAC", "US"]),
+    }, schema=arrow_schema)
+
+    print(f"\nINSERTing {len(data)} rows into '{tid}'...")
+    table.append(data)
+    print("INSERT complete.")
+
+    print(f"\nSELECT * FROM {tid}:")
+    print("-" * 90)
+    for row in table.scan().to_arrow().to_pylist():
+        print(f"  order_id={row['order_id']:2d}  customer={row['customer']:<10s}"
+              f"  product={row['product']:<12s}  qty={row['quantity']:2d}"
+              f"  total=${row['total']:7.2f}  status={row['status']:<8s}"
+              f"  region={row['region']}")
+    print("-" * 90)
+
+    print(f"\nSELECT * FROM {tid} WHERE status = 'shipped':")
+    shipped = table.scan(row_filter=EqualTo("status", "shipped")).to_arrow()
+    for row in shipped.to_pylist():
+        print(f"  order_id={row['order_id']}  customer={row['customer']:<10s}"
+              f"  total=${row['total']:.2f}")
+    print(f"Shipped orders: {shipped.num_rows}")
+
+    print(f"\nTable location : {table.location()}")
+    print(f"Snapshots      : {len(table.metadata.snapshots)}")
+    print("\nTest PASSED!")

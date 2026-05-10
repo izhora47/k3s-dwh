@@ -1,0 +1,66 @@
+# SparkApplication: Spark Connect server
+#
+# Starts a long-running Spark Connect gRPC server on port 15002 inside the cluster.
+# Clients connect via sc://spark-connect-server-svc.dwh.svc.cluster.local:15002
+#
+# Usage:
+#   kubectl apply -f spark/polaris-connect-server.yaml
+#   kubectl get sparkapplication spark-connect-server -n dwh
+#   kubectl logs -n dwh -l spark-role=driver -c spark-kubernetes-driver -f
+#   kubectl delete sparkapplication spark-connect-server -n dwh
+#   kubectl delete svc spark-connect-server-svc -n dwh
+apiVersion: spark.apache.org/v1
+kind: SparkApplication
+metadata:
+  name: spark-connect-server
+  namespace: dwh
+spec:
+  mainClass: "org.apache.spark.sql.connect.service.SparkConnectServer"
+  runtimeVersions:
+    sparkVersion: "4.1.1"
+  sparkConf:
+    "spark.kubernetes.authenticate.driver.serviceAccountName": "spark"
+    "spark.kubernetes.namespace": "dwh"
+    "spark.kubernetes.container.image": "apache/spark:4.1.1-python3"
+    "spark.kubernetes.executor.podNamePrefix": "spark-connect"
+    # Expose the Connect gRPC port on the driver
+    "spark.connect.grpc.binding.port": "15002"
+    # Resource management
+    "spark.dynamicAllocation.enabled": "true"
+    "spark.dynamicAllocation.shuffleTracking.enabled": "true"
+    "spark.dynamicAllocation.minExecutors": "1"
+    "spark.dynamicAllocation.maxExecutors": "2"
+    "spark.scheduler.mode": "FAIR"
+    "spark.kubernetes.executor.request.cores": "500m"
+    "spark.kubernetes.driver.request.cores": "500m"
+  applicationTolerations:
+    resourceRetainPolicy: OnFailure
+  driverSpec:
+    podTemplateSpec:
+      metadata:
+        labels:
+          app: spark-connect-server
+      spec:
+        containers:
+          - name: spark-kubernetes-driver
+            ports:
+              - containerPort: 15002
+                name: connect-grpc
+                protocol: TCP
+
+---
+# Service to expose the Spark Connect gRPC endpoint inside the cluster
+apiVersion: v1
+kind: Service
+metadata:
+  name: spark-connect-server-svc
+  namespace: dwh
+spec:
+  selector:
+    app: spark-connect-server
+  ports:
+    - name: connect-grpc
+      port: 15002
+      targetPort: 15002
+      protocol: TCP
+  type: ClusterIP

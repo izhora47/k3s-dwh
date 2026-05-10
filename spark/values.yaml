@@ -1,0 +1,33 @@
+# Apache Spark Kubernetes Operator Helm values
+# Chart: spark/spark-kubernetes-operator (1.5.0, operator 0.7.0)
+# Runs Spark 4.1.1 jobs in the 'dwh' namespace via SparkApplication CRDs
+
+operatorDeployment:
+  operatorPod:
+    operatorContainer:
+      resources:
+        limits:
+          cpu: "500m"
+          memory: 512Mi
+          ephemeral-storage: 1Gi
+        requests:
+          cpu: "100m"
+          memory: 512Mi
+          ephemeral-storage: 1Gi
+
+# Watch the dwh namespace for SparkApplication resources
+workloadResources:
+  namespaces:
+    create: false          # namespace 'dwh' already exists
+    overrideWatchedNamespaces: true
+    data:
+      - "dwh"
+  serviceAccount:
+    create: true
+    name: "spark"
+  clusterRole:
+    create: true
+    name: "spark-workload-clusterrole"
+  roleBinding:
+    create: true
+    name: "spark-workload-rolebinding"

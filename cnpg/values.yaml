@@ -1,0 +1,23 @@
+# CloudNativePG Operator Helm values
+# Helm repo: https://cloudnative-pg.github.io/charts
+# Chart: cloudnative-pg/cloudnative-pg
+
+replicaCount: 1
+
+# Operator resources - lightweight for k3s
+resources:
+  requests:
+    memory: 128Mi
+    cpu: 100m
+  limits:
+    memory: 512Mi
+    cpu: 500m
+
+# Watch all namespaces (including dwh)
+watchNamespaces: []
+
+# Enable pod monitoring (optional, disable if no Prometheus)
+monitoring:
+  podMonitorEnabled: false
+  grafanaDashboard:
+    create: false

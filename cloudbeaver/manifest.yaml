@@ -1,0 +1,90 @@
+# CloudBeaver — Web-based SQL IDE
+# Connects to: ClickHouse (OLAP), Trino (Iceberg lakehouse), PostgreSQL
+# Namespace: dwh
+# NodePort: 30978 → container :8978
+# First-run: complete setup wizard at http://<node-ip>:30978
+#   Set admin password, then add connections (see README.md)
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cloudbeaver-workspace
+  namespace: dwh
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+  storageClassName: local-path
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloudbeaver
+  namespace: dwh
+  labels:
+    app: cloudbeaver
+spec:
+  replicas: 1
+  strategy:
+    # H2 workspace DB on a ReadWriteOnce PVC cannot be opened by two pods
+    # at once. Replace the old pod before starting the new one.
+    type: Recreate
+  selector:
+    matchLabels:
+      app: cloudbeaver
+  template:
+    metadata:
+      labels:
+        app: cloudbeaver
+    spec:
+      containers:
+        - name: cloudbeaver
+          image: dbeaver/cloudbeaver:latest
+          ports:
+            - containerPort: 8978
+          resources:
+            requests:
+              memory: 256Mi
+              cpu: 100m
+            limits:
+              memory: 1Gi
+              cpu: "1"
+          volumeMounts:
+            - name: workspace
+              mountPath: /opt/cloudbeaver/workspace
+          readinessProbe:
+            httpGet:
+              path: /status
+              port: 8978
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /status
+              port: 8978
+            initialDelaySeconds: 60
+            periodSeconds: 30
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: cloudbeaver-workspace
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cloudbeaver
+  namespace: dwh
+  labels:
+    app: cloudbeaver
+spec:
+  type: NodePort
+  selector:
+    app: cloudbeaver
+  ports:
+    - name: http
+      port: 8978
+      targetPort: 8978
+      nodePort: 30978

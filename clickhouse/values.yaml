@@ -1,0 +1,47 @@
+# ClickHouse Operator Helm values
+# Chart: https://github.com/ClickHouse/clickhouse-operator/releases/download/v0.0.4/clickhouse-operator-helm-0.0.4.tgz
+# Official ClickHouse Inc operator (not Altinity)
+# CRDs: ClickHouseCluster (clickhouse.com/v1alpha1), KeeperCluster (clickhouse.com/v1alpha1)
+
+manager:
+  replicas: 1
+
+  image:
+    repository: ghcr.io/clickhouse/clickhouse-operator
+    pullPolicy: IfNotPresent
+
+  resources:
+    requests:
+      memory: 64Mi
+      cpu: 10m
+    limits:
+      memory: 256Mi
+      cpu: 500m
+
+# Watch all namespaces (empty = all, or list specific ones)
+watchNamespaces: []
+
+# CRDs: install and keep on uninstall
+crd:
+  enable: true
+  keep: true
+
+# Disable cert-manager and webhooks — quay.io is unreachable on this cluster.
+# For production with cert-manager available, set both to true.
+certManager:
+  enable: false
+
+webhook:
+  enable: false
+
+# No Prometheus/ServiceMonitor
+metrics:
+  enable: false
+
+prometheus:
+  scraping_annotations: false
+  service_monitor: false
+
+# RBAC helpers for admin/editor/viewer CRD roles
+rbacHelpers:
+  enable: false
