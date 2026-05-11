@@ -1,0 +1,150 @@
+# RustFS Helm values — k3s single-node, Traefik ingress, TLS via wildcard *.test.local
+# Chart: rustfs/rustfs  version 0.2.0  (app 1.0.0-beta.2)
+# S3 endpoint (external): https://s3.test.local
+# S3 endpoint (in-cluster): http://rustfs.dwh.svc.cluster.local:9000
+# Console (external):  https://s3-console.test.local
+
+replicaCount: 1
+
+image:
+  rustfs:
+    repository: rustfs/rustfs
+    pullPolicy: IfNotPresent
+    tag: ""               # uses chart appVersion = 1.0.0-beta.2
+  initImage:
+    repository: busybox
+    pullPolicy: IfNotPresent
+    tag: "stable"
+
+mode:
+  standalone:
+    enabled: true
+    strategy:
+      type: Recreate      # PVC is RWO — must stop old pod before new one starts
+  distributed:
+    enabled: false
+
+secret:
+  rustfs:
+    access_key: "lakehouseadmin"
+    secret_key: "Lk@h0use-S3-2026!"
+
+config:
+  rustfs:
+    volumes: "/data/rustfs"
+    address: ":9000"
+    console_enable: "true"
+    console_address: ":9001"
+    region: "us-east-1"
+    log_level: "info"
+    obs_log_directory: "/logs"
+    obs_environment: "development"
+
+service:
+  type: ClusterIP
+  endpoint:
+    port: 9000
+    nodePort: 32000
+  console:
+    port: 9001
+    nodePort: 32001
+
+# S3 API ingress via Traefik — https://s3.test.local
+ingress:
+  enabled: true
+  className: "traefik"
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+  hosts:
+    - host: s3.test.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    enabled: true
+    existingSecret:
+      enabled: true
+      name: rustfs-tls
+
+# Console ingress via Traefik — https://s3-console.test.local
+# Deployed as extraManifests because the chart only creates one ingress
+extraManifests:
+  - apiVersion: networking.k8s.io/v1
+    kind: Ingress
+    metadata:
+      name: rustfs-console
+      namespace: dwh
+      annotations:
+        traefik.ingress.kubernetes.io/router.entrypoints: websecure
+        traefik.ingress.kubernetes.io/router.tls: "true"
+    spec:
+      ingressClassName: traefik
+      tls:
+        - hosts:
+            - s3-console.test.local
+          secretName: rustfs-tls
+      rules:
+        - host: s3-console.test.local
+          http:
+            paths:
+              - path: /
+                pathType: Prefix
+                backend:
+                  service:
+                    name: rustfs
+                    port:
+                      number: 9001
+
+storageclass:
+  name: local-path
+  dataStorageSize: 20Gi
+  logStorageSize: 1Gi
+
+resources:
+  requests:
+    memory: 256Mi
+    cpu: 100m
+  limits:
+    memory: 2Gi
+    cpu: "2"
+
+podSecurityContext:
+  fsGroup: 10001
+  runAsUser: 10001
+  runAsGroup: 10001
+
+containerSecurityContext:
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  runAsNonRoot: true
+
+livenessProbe:
+  enabled: true
+  httpGet:
+    path: /health
+    port: 9000
+    scheme: HTTP
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+readinessProbe:
+  enabled: true
+  httpGet:
+    path: /health/ready
+    port: 9000
+    scheme: HTTP
+  initialDelaySeconds: 15
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+affinity:
+  podAntiAffinity:
+    enabled: false   # single node — anti-affinity would block scheduling
+  nodeAffinity: {}

@@ -1,0 +1,94 @@
+# CNPG Pooler — PgBouncer managed by the CloudNativePG operator
+#
+# This is the correct way to add PgBouncer to a CNPG cluster.
+# The operator manages the PgBouncer deployment, auth sync, config reload,
+# and automatic failover tracking (if the primary changes, the pooler follows).
+#
+# Two poolers are defined:
+#   polaris-pg-pooler-rw  — transaction-mode, routes to primary (writes + reads)
+#   polaris-pg-pooler-ro  — transaction-mode, routes to replicas (scale-out reads)
+#
+# Connection string for services (e.g. Superset):
+#   postgresql://<user>:<pass>@polaris-pg-pooler-rw.dwh.svc.cluster.local:5432/<db>
+#
+# transaction pool mode: the PostgreSQL connection is held only while a query is
+# running. Best for stateless apps (Superset, FastAPI, etc.) with many concurrent
+# short-lived connections. NOT suitable for: advisory locks, LISTEN/NOTIFY,
+# SET session variables that persist across queries, temporary tables.
+#
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Pooler
+metadata:
+  name: polaris-pg-pooler-rw
+  namespace: dwh
+spec:
+  cluster:
+    name: polaris-pg
+
+  # rw: always routes to primary — use for read-write connections
+  type: rw
+  instances: 1
+
+  pgbouncer:
+    poolMode: transaction
+    parameters:
+      max_client_conn: "200"      # max inbound client connections
+      default_pool_size: "25"     # server connections per (db, user) pair
+      reserve_pool_size: "5"      # extra connections for burst
+      reserve_pool_timeout: "5"   # seconds before reserve kicks in
+      max_db_connections: "50"    # total server connections per database
+      server_idle_timeout: "600"  # close idle server connection after 10 min
+      log_connections: "0"
+      log_disconnections: "0"
+
+  # Pod resources — PgBouncer is lightweight
+  template:
+    spec:
+      containers:
+        - name: pgbouncer
+          resources:
+            requests:
+              memory: 32Mi
+              cpu: 10m
+            limits:
+              memory: 128Mi
+              cpu: 200m
+
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Pooler
+metadata:
+  name: polaris-pg-pooler-ro
+  namespace: dwh
+spec:
+  cluster:
+    name: polaris-pg
+
+  # ro: routes to replicas — use for read-only analytics / reporting
+  # Falls back to primary when no replicas available (single-instance cluster)
+  type: ro
+  instances: 1
+
+  pgbouncer:
+    poolMode: transaction
+    parameters:
+      max_client_conn: "100"
+      default_pool_size: "15"
+      reserve_pool_size: "3"
+      max_db_connections: "30"
+      server_idle_timeout: "600"
+      log_connections: "0"
+      log_disconnections: "0"
+
+  template:
+    spec:
+      containers:
+        - name: pgbouncer
+          resources:
+            requests:
+              memory: 32Mi
+              cpu: 10m
+            limits:
+              memory: 128Mi
+              cpu: 200m

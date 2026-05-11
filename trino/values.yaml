@@ -1,7 +1,7 @@
 # Trino Helm values for k3s single-node data lakehouse
 # Chart: trino/trino (1.42.2, app version 480)
-# Connects to: Polaris REST catalog (Iceberg) + Ozone S3 storage
-# Namespace: dwh (co-located with Polaris and Ozone)
+# Connects to: Polaris REST catalog (Iceberg) + RustFS S3 storage
+# Namespace: dwh (co-located with Polaris and RustFS)
 
 image:
   tag: "480"
@@ -80,7 +80,8 @@ catalogs:
     connector.name=tpcds
     tpcds.splits-per-node=4
 
-  # Apache Iceberg via Polaris REST catalog + Ozone S3 storage
+  # Apache Iceberg via Polaris REST catalog + RustFS S3 storage
+  # To switch back to Ozone: change s3.endpoint to http://ozone-s3g-rest.dwh.svc.cluster.local:9878
   # Trino 480 property names (differ from older versions):
   #   oauth2.credential replaces oauth2.client-id + oauth2.client-secret
   #   oauth2.server-uri replaces oauth2.token-endpoint
@@ -97,14 +98,15 @@ catalogs:
     iceberg.rest-catalog.oauth2.server-uri=http://polaris.dwh.svc.cluster.local:8181/api/catalog/v1/oauth/tokens
     iceberg.rest-catalog.oauth2.scope=PRINCIPAL_ROLE:ALL
     fs.native-s3.enabled=true
-    s3.endpoint=http://ozone-s3g-rest.dwh.svc.cluster.local:9878
+    s3.endpoint=http://rustfs-svc.dwh.svc.cluster.local:9000
     s3.path-style-access=true
     s3.region=us-east-1
     s3.aws-access-key=${ENV:AWS_ACCESS_KEY_ID}
     s3.aws-secret-key=${ENV:AWS_SECRET_ACCESS_KEY}
 
 
-# Ozone S3 credentials injected into all pods (coordinator + workers)
+# S3 credentials injected into all pods (coordinator + workers)
+# Secret ozone-s3-creds is reused — update its contents to switch backends
 # Chart uses top-level `env`, not coordinator/worker.extraEnv
 env:
   - name: AWS_ACCESS_KEY_ID

@@ -57,8 +57,10 @@ features:
     - S3
   ALLOW_INSECURE_STORAGE_TYPES: true
 
-# S3/Ozone endpoint and credentials for catalog storage
-# Ozone S3G in non-secure mode accepts any credentials
+# S3 credentials — secret name shared with Trino; update secret to switch backends.
+# Endpoint switch:
+#   RustFS : http://rustfs-svc.dwh.svc.cluster.local:9000   ← active
+#   Ozone  : http://ozone-s3g-rest.dwh.svc.cluster.local:9878
 extraEnv:
   - name: AWS_ACCESS_KEY_ID
     valueFrom:
@@ -74,11 +76,8 @@ extraEnv:
         optional: true
   - name: AWS_REGION
     value: "us-east-1"
-  # Route Polaris S3FileIO calls to Ozone S3 Gateway instead of real AWS.
-  # AWS SDK v2 honours AWS_ENDPOINT_URL_S3 for per-service endpoint override.
   - name: AWS_ENDPOINT_URL_S3
-    value: "http://ozone-s3g-rest.dwh.svc.cluster.local:9878"
-  # Disable STS (no Kerberos security on Ozone in dev mode)
+    value: "http://rustfs-svc.dwh.svc.cluster.local:9000"
   - name: AWS_EC2_METADATA_DISABLED
     value: "true"
 

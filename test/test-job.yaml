@@ -1,6 +1,6 @@
 # Kubernetes Job: PyIceberg lakehouse integration test
 # Runs test: creates namespace, table, INSERTs and SELECTs data
-# via Polaris REST catalog with Ozone S3 backend.
+# via Polaris REST catalog — S3 backend is whatever ozone-s3-creds secret points to.
 #
 # Usage:
 #   kubectl apply -f test/test-job.yaml
@@ -32,15 +32,20 @@ spec:
               echo "Waiting for Polaris..."
               until nc -z polaris.dwh.svc.cluster.local 8181; do sleep 3; done
               echo "Polaris is ready."
-        - name: wait-for-ozone
+        - name: wait-for-s3
           image: busybox:1.36
           command:
             - sh
             - -c
             - |
-              echo "Waiting for Ozone S3 Gateway..."
-              until nc -z ozone-s3g-rest.dwh.svc.cluster.local 9878; do sleep 3; done
-              echo "Ozone S3 Gateway is ready."
+              echo "Waiting for S3 backend (${S3_HOST}:${S3_PORT})..."
+              until nc -z "${S3_HOST}" "${S3_PORT}"; do sleep 3; done
+              echo "S3 backend is ready."
+          env:
+            - name: S3_HOST
+              value: "rustfs-svc.dwh.svc.cluster.local"
+            - name: S3_PORT
+              value: "9000"
       containers:
         - name: test
           image: python:3.12-slim
@@ -63,23 +68,20 @@ spec:
               value: "lakehouse"
             - name: POLARIS_REALM
               value: "POLARIS"
-            - name: OZONE_ENDPOINT
-              value: "http://ozone-s3g-rest.dwh.svc.cluster.local:9878"
-            - name: OZONE_ACCESS_KEY
+            - name: S3_ENDPOINT
+              value: "http://rustfs-svc.dwh.svc.cluster.local:9000"
+            - name: S3_ACCESS_KEY
               valueFrom:
                 secretKeyRef:
                   name: ozone-s3-creds
                   key: access-key
-            - name: OZONE_SECRET_KEY
+            - name: S3_SECRET_KEY
               valueFrom:
                 secretKeyRef:
                   name: ozone-s3-creds
                   key: secret-key
-            - name: OZONE_BUCKET
+            - name: S3_BUCKET
               value: "lakehouse"
-                    # Force PyArrow to use small part size to avoid empty-file multipart issues with Ozone
-            - name: ARROW_S3_MIN_PART_SIZE
-              value: "5242880"
           volumeMounts:
             - name: test-script
               mountPath: /test
@@ -104,11 +106,12 @@ data:
   test_lakehouse.py: |
     #!/usr/bin/env python3
     """
-    Polaris + Ozone Lakehouse integration test.
+    Polaris + S3 Lakehouse integration test.
+    Works with any S3-compatible backend (RustFS, Ozone, MinIO, etc.)
     1. Connect to Polaris REST catalog
     2. Create namespace 'bronze' (idempotent)
     3. Create table 'bronze.orders' (idempotent)
-    4. INSERT 5 rows via PyIceberg + fsspec (avoids PyArrow multipart issues with Ozone)
+    4. INSERT 5 rows via PyIceberg + fsspec
     5. SELECT all rows + filtered query
     """
     import os
@@ -126,11 +129,10 @@ data:
     POLARIS_SECRET    = os.getenv("POLARIS_CLIENT_SECRET")
     POLARIS_WAREHOUSE = os.getenv("POLARIS_WAREHOUSE")
     POLARIS_REALM     = os.getenv("POLARIS_REALM", "POLARIS")
-    OZONE_ENDPOINT    = os.getenv("OZONE_ENDPOINT")
-    OZONE_ACCESS_KEY  = os.getenv("OZONE_ACCESS_KEY")
-    OZONE_SECRET_KEY  = os.getenv("OZONE_SECRET_KEY")
+    S3_ENDPOINT       = os.getenv("S3_ENDPOINT")
+    S3_ACCESS_KEY     = os.getenv("S3_ACCESS_KEY")
+    S3_SECRET_KEY     = os.getenv("S3_SECRET_KEY")
 
-    # fsspec I/O avoids PyArrow multipart upload issues with Ozone
     catalog = load_catalog(POLARIS_WAREHOUSE, **{
         "type": "rest",
         "uri": POLARIS_URI,
@@ -140,22 +142,20 @@ data:
         "header.Polaris-Realm": POLARIS_REALM,
         "header.X-Iceberg-Access-Delegation": "",
         "py-io-impl": "pyiceberg.io.fsspec.FsspecFileIO",
-        "s3.endpoint": OZONE_ENDPOINT,
-        "s3.access-key-id": OZONE_ACCESS_KEY,
-        "s3.secret-access-key": OZONE_SECRET_KEY,
+        "s3.endpoint": S3_ENDPOINT,
+        "s3.access-key-id": S3_ACCESS_KEY,
+        "s3.secret-access-key": S3_SECRET_KEY,
         "s3.region": "us-east-1",
         "s3.path-style-access": "true",
     })
-    print("Connected to Polaris catalog.")
+    print(f"Connected to Polaris catalog (S3 endpoint: {S3_ENDPOINT})")
 
-    # Create namespace (idempotent)
     try:
         catalog.create_namespace("bronze")
         print("Namespace 'bronze' created.")
     except NamespaceAlreadyExistsError:
         print("Namespace 'bronze' already exists.")
 
-    # Iceberg schema for orders table
     iceberg_schema = Schema(
         NestedField(1, "order_id",   IntegerType(), required=True),
         NestedField(2, "customer",   StringType(),  required=True),
@@ -167,7 +167,6 @@ data:
         NestedField(8, "region",     StringType()),
     )
 
-    # Create table (idempotent)
     tid = "bronze.orders"
     try:
         table = catalog.create_table(tid, schema=iceberg_schema)
@@ -176,7 +175,6 @@ data:
         table = catalog.load_table(tid)
         print(f"Table '{tid}' already exists, loaded.")
 
-    # Arrow schema for data insertion
     arrow_schema = pa.schema([
         pa.field("order_id",   pa.int32(),   nullable=False),
         pa.field("customer",   pa.string(),  nullable=False),
@@ -211,12 +209,11 @@ data:
               f"  region={row['region']}")
     print("-" * 90)
 
-    print(f"\nSELECT * FROM {tid} WHERE status = 'shipped':")
     shipped = table.scan(row_filter=EqualTo("status", "shipped")).to_arrow()
+    print(f"\nShipped orders ({shipped.num_rows}):")
     for row in shipped.to_pylist():
         print(f"  order_id={row['order_id']}  customer={row['customer']:<10s}"
               f"  total=${row['total']:.2f}")
-    print(f"Shipped orders: {shipped.num_rows}")
 
     print(f"\nTable location : {table.location()}")
     print(f"Snapshots      : {len(table.metadata.snapshots)}")

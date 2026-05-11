@@ -1,8 +1,8 @@
 # Data Lakehouse on k3s
 
 Apache Iceberg lakehouse on a single-node k3s cluster. Apache Polaris manages the Iceberg REST catalog,
-Apache Ozone provides S3-compatible storage, Trino queries the lakehouse via SQL, and ClickHouse handles
-OLAP analytics. All components deploy via a single `install.sh` script.
+RustFS provides S3-compatible object storage (replaceable with Apache Ozone), Trino queries the lakehouse
+via SQL, and ClickHouse handles OLAP analytics. All components deploy via a single `install.sh` script.
 
 ---
 
@@ -10,13 +10,13 @@ OLAP analytics. All components deploy via a single `install.sh` script.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│  k3s cluster (single node: aurora, 4 CPU / 8 GB RAM)                │
+│  k3s cluster (single node: aurora, 4 CPU / 24 GB RAM)               │
 │                                                                      │
 │  namespace: dwh                                                      │
 │  ┌─────────────────┐   ┌──────────────────┐   ┌──────────────────┐  │
-│  │ Apache Polaris  │   │ CloudNativePG    │   │  Apache Ozone    │  │
-│  │ Iceberg REST    │──▶│ PostgreSQL 16    │   │  S3 Gateway      │  │
-│  │ Catalog :8181   │   │ (polaris-pg)     │   │  :9878           │  │
+│  │ Apache Polaris  │   │ CloudNativePG    │   │  RustFS 1.0-beta │  │
+│  │ Iceberg REST    │──▶│ PostgreSQL 16    │   │  S3 API  :9000   │  │
+│  │ Catalog :8181   │   │ (polaris-pg)     │   │  Console :9001   │  │
 │  └────────┬────────┘   └──────────────────┘   └────────┬─────────┘  │
 │           │  metadata + auth                  data files│            │
 │           │  ◀────────────────────────────────────────  │            │
@@ -52,8 +52,11 @@ OLAP analytics. All components deploy via a single `install.sh` script.
 Client (PyIceberg / Trino / ClickHouse)
   → POST /api/catalog/v1/oauth/tokens   → Polaris (auth)
   → GET/POST /api/catalog/v1/...        → Polaris (table metadata)
-  → s3://lakehouse/...                  → Ozone S3 Gateway (data files, parquet)
+  → s3://lakehouse/...                  → RustFS S3 API (data files, parquet)
 ```
+
+**Active S3 backend: RustFS** (`rustfs-svc.dwh.svc.cluster.local:9000`)
+Ingress: `https://s3.test.local` (S3 API) / `https://s3-console.test.local` (console UI)
 
 ---
 
@@ -62,7 +65,8 @@ Client (PyIceberg / Trino / ClickHouse)
 | Service | NodePort | In-cluster DNS |
 |---|---|---|
 | Apache Polaris | `30181` | `polaris.dwh.svc.cluster.local:8181` |
-| Apache Ozone S3 Gateway | `30878` | `ozone-s3g-rest.dwh.svc.cluster.local:9878` |
+| RustFS S3 API | — | `rustfs-svc.dwh.svc.cluster.local:9000` (HTTPS via Traefik `s3.test.local`) |
+| RustFS Console | — | `rustfs-svc.dwh.svc.cluster.local:9001` (HTTPS via Traefik `s3-console.test.local`) |
 | Trino | `30880` | `trino.dwh.svc.cluster.local:8080` |
 | ClickHouse HTTP | `30123` | `clickhouse.clickhouse.svc.cluster.local:8123` |
 | ClickHouse native | `30900` | `clickhouse.clickhouse.svc.cluster.local:9000` |
@@ -77,7 +81,7 @@ Client (PyIceberg / Trino / ClickHouse)
 |---|---|---|
 | `cnpg/cloudnative-pg` | `https://cloudnative-pg.github.io/charts` | ≥ 1.24 |
 | `polaris/polaris` | `https://downloads.apache.org/polaris/helm-chart` | `1.3.0-incubating` |
-| `ozone/ozone` | `https://apache.github.io/ozone-helm-charts/` | `0.2.0` |
+| `rustfs/rustfs` | `https://charts.rustfs.com` | `0.2.0` (app 1.0.0-beta.2) |
 | `trino/trino` | `https://trinodb.github.io/charts` | `1.42.2` (app 480) |
 | `clickhouse-operator` | GitHub release (no repo) | `v0.0.4` |
 | `spark/spark-kubernetes-operator` | `https://apache.github.io/spark-kubernetes-operator` | `1.5.0` |
@@ -95,12 +99,21 @@ dwh/
 ├── install.sh              ← One-shot install script
 ├── uninstall.sh            ← Teardown script
 ├── namespace.yaml          ← dwh namespace
+├── backup/
+│   ├── pg-backup.sh        ← PostgreSQL dump via kubectl exec → local file
+│   ├── pg-restore.sh       ← PostgreSQL restore from dump file
+│   ├── ch-backup.sh        ← ClickHouse BACKUP DATABASE → RustFS S3
+│   └── ch-restore.sh       ← ClickHouse RESTORE DATABASE ← RustFS S3
 ├── cnpg/
-│   └── pg-cluster.yaml     ← CNPG PostgreSQL cluster (polaris-pg)
+│   ├── pg-cluster.yaml     ← CNPG PostgreSQL cluster (polaris-pg)
+│   └── pooler.yaml         ← PgBouncer Pooler CR (rw + ro, transaction mode)
 ├── polaris/
 │   ├── CLAUDE.md           ← Polaris gotchas + auth flow reference
 │   ├── README.md           ← Polaris API command reference
-│   └── values.yaml         ← Polaris Helm values
+│   └── values.yaml         ← Polaris Helm values (S3 endpoint via AWS_ENDPOINT_URL_S3)
+├── rustfs/
+│   ├── README.md           ← User management, TLS notes, known chart issues
+│   └── values.yaml         ← RustFS Helm values (standalone, Traefik TLS ingress)
 ├── ozone/
 │   ├── CLAUDE.md
 │   ├── README.md
@@ -108,7 +121,7 @@ dwh/
 ├── trino/
 │   ├── CLAUDE.md           ← Trino 480 property renames + gotchas
 │   ├── README.md           ← Queries reference
-│   └── values.yaml
+│   └── values.yaml         ← Trino catalog config (s3.endpoint for active backend)
 ├── clickhouse/
 │   ├── CLAUDE.md           ← Official operator CRD schema + gotchas
 │   ├── README.md
@@ -213,7 +226,51 @@ kubectl -n $NS create secret generic polaris-token-broker \
   --from-file=/tmp/symmetric.key
 ```
 
-#### Step 5 — Apache Ozone (optional)
+#### Step 5 — RustFS S3 storage (active backend)
+
+RustFS is the default S3 backend. It runs as a single-node standalone server behind Traefik TLS ingress.
+
+```bash
+# 1. Create TLS secret from wildcard cert (*.test.local, valid until May 2028)
+kubectl -n dwh create secret tls rustfs-tls \
+  --cert=/home/nik/projects/ssl-certs/test.local.crt \
+  --key=/home/nik/projects/ssl-certs/test.local.key
+
+# 2. Create S3 credentials secret (reused by Polaris + Trino)
+kubectl -n dwh create secret generic ozone-s3-creds \
+  --from-literal=access-key="lakehouseadmin" \
+  --from-literal=secret-key="Lk@h0use-S3-2026!"
+
+# 3. Deploy RustFS
+helm repo add rustfs https://charts.rustfs.com
+helm upgrade --install rustfs rustfs/rustfs \
+  --version 0.2.0 --namespace dwh --values rustfs/values.yaml --wait --timeout 5m
+
+# 4. Create lakehouse bucket
+kubectl run rustfs-init --rm -i --restart=Never -n dwh \
+  --image=amazon/aws-cli:latest \
+  --env="AWS_ACCESS_KEY_ID=lakehouseadmin" \
+  --env="AWS_SECRET_ACCESS_KEY=Lk@h0use-S3-2026!" \
+  --env="AWS_DEFAULT_REGION=us-east-1" \
+  -- s3 mb s3://lakehouse \
+     --endpoint-url http://rustfs-svc.dwh.svc.cluster.local:9000
+```
+
+**Hosts entries required** (add to `/etc/hosts` in WSL and Windows `C:\Windows\System32\drivers\etc\hosts`):
+```
+100.64.193.139  s3.test.local  s3-console.test.local
+```
+
+> The chart has a known bug: the default ingress points to the console port (9001) instead of the S3
+> API port (9000). After install, patch it:
+> ```bash
+> kubectl -n dwh patch ingress rustfs --type=json \
+>   -p='[{"op":"replace","path":"/spec/rules/0/http/paths/0/backend/service/port/name","value":"endpoint"}]'
+> ```
+
+#### Step 5b — Apache Ozone (alternative backend)
+
+Ozone is an S3-compatible + HDFS-compatible object store. Use it instead of RustFS for Hadoop ecosystem integration (ofs:// URIs, Spark with OzoneFileSystem, etc.). For a pure S3 use case, RustFS is simpler.
 
 ```bash
 helm repo add ozone https://apache.github.io/ozone-helm-charts/
@@ -315,7 +372,7 @@ kubectl exec -n dwh "$POLARIS_POD" -- curl -sS -X POST \
 
 #### Step 9 — Trino (optional)
 
-Requires Ozone deployed (Step 5).
+Requires an S3 backend deployed (Step 5 or 5b).
 
 ```bash
 helm repo add trino https://trinodb.github.io/charts
@@ -474,7 +531,7 @@ DROP TABLE default.test;
 | Password | *(empty)* |
 
 Click **Test Connection** → **Create**. To browse Iceberg tables, navigate to
-**lakehouse → bronze**.
+**lakehouse → silver**.
 
 **Test queries:**
 
@@ -487,13 +544,13 @@ FROM tpch.sf1.lineitem
 GROUP BY l_returnflag
 ORDER BY l_returnflag;
 
--- Iceberg lakehouse
+-- Iceberg lakehouse (RustFS-backed)
 SHOW SCHEMAS IN lakehouse;
-SHOW TABLES IN lakehouse.bronze;
-SELECT * FROM lakehouse.bronze.orders LIMIT 10;          -- if lakehouse-test ran
+SHOW TABLES IN lakehouse.silver;
+SELECT * FROM lakehouse.silver.test_orders LIMIT 10;
 
 -- Iceberg time travel
-SELECT * FROM lakehouse.bronze.orders
+SELECT * FROM lakehouse.silver.test_orders
 FOR VERSION AS OF <snapshot_id>;
 ```
 
@@ -538,6 +595,263 @@ SELECT version(), current_database(), current_user;
 
 ---
 
+## PostgreSQL Connection Pooling (PgBouncer)
+
+PgBouncer is deployed as a CNPG `Pooler` CR — managed by the CloudNativePG operator, not
+as a standalone deployment. This is the correct approach: the operator handles auth sync,
+automatic failover tracking, and lifecycle management.
+
+### Why PgBouncer should be part of CNPG (not standalone)
+
+| Concern | CNPG Pooler CR | Standalone PgBouncer |
+|---|---|---|
+| Auth sync | Automatic — operator reads `pg_shadow` | Manual — update config on password rotation |
+| Failover | Operator rewires to new primary automatically | Manual config update required |
+| Lifecycle | Managed alongside cluster | Separate deployment to maintain |
+| TLS | Operator-managed certificates | Manual certificate wiring |
+
+### Poolers deployed
+
+| Service | Type | Port | Use for |
+|---|---|---|---|
+| `polaris-pg-pooler-rw.dwh.svc.cluster.local` | rw → primary | 5432 | writes + reads (Superset, services) |
+| `polaris-pg-pooler-ro.dwh.svc.cluster.local` | ro → replicas | 5432 | read-only analytics (falls back to primary when single instance) |
+
+Both run in **transaction pool mode** — optimal for stateless apps that open many short-lived
+connections. Not suitable for: advisory locks, `LISTEN`/`NOTIFY`, temp tables spanning statements.
+
+### Deploy
+
+```bash
+kubectl apply -f cnpg/pooler.yaml
+kubectl rollout status deployment/polaris-pg-pooler-rw -n dwh
+kubectl rollout status deployment/polaris-pg-pooler-ro -n dwh
+```
+
+### Connect via pooler (CNPG TLS required)
+
+The CNPG pooler requires `sslmode=require`. Direct test:
+
+```bash
+PGPASSWORD=$(kubectl get secret polaris-pg-app -n dwh \
+  -o jsonpath='{.data.password}' | base64 -d)
+
+kubectl exec -n dwh polaris-pg-1 -c postgres -- \
+  env PGPASSWORD="$PGPASSWORD" \
+  psql "host=polaris-pg-pooler-rw.dwh.svc.cluster.local sslmode=require user=polaris dbname=polaris" \
+  -c "SELECT current_database(), now();"
+```
+
+### Add a new database for an external service (e.g. Superset)
+
+```bash
+# Create on the primary using peer auth (no password needed for superuser)
+kubectl exec -n dwh polaris-pg-1 -c postgres -- psql -U postgres -c "
+  CREATE USER superset WITH PASSWORD 'Sup3rset-2026!';
+  CREATE DATABASE superset OWNER superset;"
+
+# Superset connection string (via pooler):
+# postgresql://superset:Sup3rset-2026!@polaris-pg-pooler-rw.dwh.svc.cluster.local:5432/superset?sslmode=require
+```
+
+---
+
+## ClickHouse — Scaling and Enterprise Readiness
+
+### Current configuration
+
+Single server: `shards: 1 × replicas: 1` + `KeeperCluster replicas: 1`.
+No HA, no failover, no horizontal scale.
+
+### For 1 GB/day ingestion + 2 TB total
+
+**ClickHouse handles this comfortably on a single server:**
+- 1 GB/day raw ≈ 73–146 GB/year on disk after LZ4 compression (5–10× typical for events/logs)
+- 2 TB raw ≈ 200–400 GB compressed — fits on a single 1 TB SSD
+- `async_insert` is already enabled — built for high-frequency small-batch ingestion
+- No sharding needed at this scale
+
+**What to grow first:**
+1. **PVC size** — current 20 Gi is a dev limit. For 2 TB: `storage: 1Ti`
+2. **RAM** — bump `limits.memory` from 4Gi to 16–32Gi (mark cache + query memory)
+3. **CPU** — bump `limits.cpu` from 2 to 8+ for concurrent analytics queries
+
+### Path to HA (production)
+
+Change `clickhouse/clickhouse-cluster.yaml`:
+```yaml
+shards: 1       # 2+ for data partitioning; 1 is fine for 2 TB
+replicas: 2     # 2 = HA — full data copy on each replica
+```
+
+Change `clickhouse/keeper-cluster.yaml`:
+```yaml
+replicas: 3     # always odd for quorum
+```
+
+**Shards vs replicas:** at 2 TB, `replicas: 2` (HA without data partitioning) is right.
+Add shards only when a single node's disk or write throughput becomes the bottleneck.
+
+### Enterprise readiness at 1 GB/day / 2 TB
+
+| Requirement | Current state | Production fix |
+|---|---|---|
+| Data volume (2 TB) | ✓ Single node handles 10+ TB | Expand PVC to 1Ti+ |
+| Ingestion (1 GB/day) | ✓ async_insert configured | Tune `async_insert_max_data_size` |
+| HA / failover | ✗ Single replica | replicas: 2, Keeper: 3 |
+| Authentication | ✗ No password | Add users with `password_sha256_hex` |
+| TLS | ✗ Ports 8123/9000 unencrypted | Configure TLS in `extraConfig` |
+| Backups | ✓ Scripts in `backup/` (→ RustFS) | Add cron schedule |
+| Monitoring | ✗ No metrics | Enable `metrics.enable: true` |
+
+**Verdict:** ClickHouse itself is enterprise-grade software. At 1 GB/day + 2 TB it's well within
+its comfort zone. The current k3s deployment needs HA replicas, auth, and TLS before
+it's production-ready, but none of these require changing the data model or storage engine.
+
+---
+
+## RustFS User Management
+
+RustFS uses the MinIO-compatible Admin API. The `mc` (MinIO client) image is the easiest way to manage users from within the cluster.
+
+### Create a user and assign access
+
+```bash
+kubectl run mc-tmp --rm -i --restart=Never -n dwh \
+  --image=minio/mc:latest \
+  --command -- /bin/sh -c "
+    mc alias set rustfs http://rustfs-svc.dwh.svc.cluster.local:9000 \
+      lakehouseadmin 'Lk@h0use-S3-2026!' >/dev/null
+
+    mc admin user add rustfs alice 'Al!ce-S3-2026!'
+    mc admin policy attach rustfs readwrite --user alice
+    mc admin user info rustfs alice"
+```
+
+Built-in policies: `readonly`, `readwrite`, `writeonly`, `consoleAdmin`, `diagnostics`.
+
+### Create a service account (separate access key for an app)
+
+```bash
+kubectl run mc-tmp --rm -i --restart=Never -n dwh \
+  --image=minio/mc:latest \
+  --command -- /bin/sh -c "
+    mc alias set rustfs http://rustfs-svc.dwh.svc.cluster.local:9000 \
+      lakehouseadmin 'Lk@h0use-S3-2026!' >/dev/null
+    mc admin accesskey create rustfs alice"
+```
+
+Output: a new `Access Key` + `Secret Key` pair scoped to `alice`'s policies.
+
+### Bucket-scoped policy (least privilege)
+
+```bash
+kubectl run mc-tmp --rm -i --restart=Never -n dwh \
+  --image=minio/mc:latest \
+  --command -- /bin/sh -c "
+    mc alias set rustfs http://rustfs-svc.dwh.svc.cluster.local:9000 \
+      lakehouseadmin 'Lk@h0use-S3-2026!' >/dev/null
+
+    cat > /tmp/lakehouse-rw.json << 'EOF'
+{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",
+\"Action\":[\"s3:GetObject\",\"s3:PutObject\",\"s3:DeleteObject\",\"s3:ListBucket\"],
+\"Resource\":[\"arn:aws:s3:::lakehouse\",\"arn:aws:s3:::lakehouse/*\"]}]}
+EOF
+    mc admin policy create rustfs lakehouse-rw /tmp/lakehouse-rw.json
+    mc admin policy attach rustfs lakehouse-rw --user alice
+    mc admin user info rustfs alice"
+```
+
+### List / remove users
+
+```bash
+kubectl run mc-tmp --rm -i --restart=Never -n dwh \
+  --image=minio/mc:latest \
+  --command -- /bin/sh -c "
+    mc alias set rustfs http://rustfs-svc.dwh.svc.cluster.local:9000 \
+      lakehouseadmin 'Lk@h0use-S3-2026!' >/dev/null
+    mc admin user list rustfs
+    mc admin user remove rustfs alice"
+```
+
+> For full reference (service accounts, custom policies, AWS CLI alternative) see `rustfs/README.md`.
+
+---
+
+## Switching S3 Backend (RustFS ↔ Ozone)
+
+Three files control which S3 backend is active. Change all three together when switching.
+
+### RustFS → Ozone
+
+**1. Polaris** (`polaris/values.yaml` → `extraEnv`):
+```yaml
+- name: AWS_ENDPOINT_URL_S3
+  value: "http://ozone-s3g-rest.dwh.svc.cluster.local:9878"   # ← Ozone
+# value: "http://rustfs-svc.dwh.svc.cluster.local:9000"       # RustFS
+```
+
+**2. Trino** (`trino/values.yaml` → `catalogs.lakehouse`):
+```
+s3.endpoint=http://ozone-s3g-rest.dwh.svc.cluster.local:9878   # ← Ozone
+# s3.endpoint=http://rustfs-svc.dwh.svc.cluster.local:9000     # RustFS
+```
+
+**3. S3 credentials secret** (`ozone-s3-creds`):
+```bash
+# Ozone credentials (non-secure mode — any value works)
+kubectl -n dwh create secret generic ozone-s3-creds \
+  --from-literal=access-key="ozone" \
+  --from-literal=secret-key="ozone-secret123" \
+  --dry-run=client -o yaml | kubectl apply -f -
+```
+
+**4. Apply:**
+```bash
+helm upgrade polaris polaris/polaris --version 1.3.0-incubating \
+  -n dwh --values polaris/values.yaml
+helm upgrade trino trino/trino --version 1.42.2 \
+  -n dwh --values trino/values.yaml
+```
+
+### Ozone → RustFS
+
+**1. Polaris** (`polaris/values.yaml` → `extraEnv`):
+```yaml
+- name: AWS_ENDPOINT_URL_S3
+  value: "http://rustfs-svc.dwh.svc.cluster.local:9000"        # ← RustFS
+```
+
+**2. Trino** (`trino/values.yaml` → `catalogs.lakehouse`):
+```
+s3.endpoint=http://rustfs-svc.dwh.svc.cluster.local:9000       # ← RustFS
+```
+
+**3. S3 credentials secret:**
+```bash
+kubectl -n dwh create secret generic ozone-s3-creds \
+  --from-literal=access-key="lakehouseadmin" \
+  --from-literal=secret-key="Lk@h0use-S3-2026!" \
+  --dry-run=client -o yaml | kubectl apply -f -
+```
+
+**4. Apply** (same helm upgrade commands as above).
+
+> **Why one secret name for both?** Polaris and Trino reference `ozone-s3-creds` by name.
+> Keeping the name constant means only the secret's content changes when switching backends —
+> no Helm value edits for the secret reference itself.
+
+### Test after switching
+
+```bash
+# Trino quick smoke test
+kubectl run trino-test --rm -i --restart=Never -n dwh --image=trinodb/trino:480 -- \
+  trino --server http://trino.dwh.svc.cluster.local:8080 \
+        --execute "SHOW SCHEMAS IN lakehouse; SELECT COUNT(*) FROM tpch.sf1.orders"
+```
+
+---
+
 ## Testing the Lakehouse
 
 ### PyIceberg integration test (via Kubernetes Job)
@@ -573,19 +887,26 @@ Test PASSED!
 ### Trino SQL
 
 ```bash
-NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+# Via CLI from a temp pod — TPC-H (no S3 needed)
+kubectl run trino-test --rm -i --restart=Never -n dwh --image=trinodb/trino:480 -- \
+  trino --server http://trino.dwh.svc.cluster.local:8080 \
+        --execute "SELECT COUNT(*) AS orders FROM tpch.sf1.orders"
+# Expected: 1500000
 
-# Via CLI from a temp pod
-kubectl run trino-cli --rm -i --restart=Never --image=trinodb/trino:480 \
-  -- trino --server "http://trino.dwh.svc.cluster.local:8080" \
-     --catalog lakehouse --schema bronze \
-     --execute "SHOW TABLES"
+# List lakehouse schemas and tables
+kubectl run trino-test --rm -i --restart=Never -n dwh --image=trinodb/trino:480 -- \
+  trino --server http://trino.dwh.svc.cluster.local:8080 \
+        --execute "SHOW SCHEMAS IN lakehouse; SHOW TABLES IN lakehouse.silver"
 
-# TPC-H test (no S3 needed)
-kubectl run trino-cli --rm -i --restart=Never --image=trinodb/trino:480 \
-  -- trino --server "http://trino.dwh.svc.cluster.local:8080" \
-     --catalog tpch --schema sf1 \
-     --execute "SELECT COUNT(*) FROM orders"
+# Full Iceberg write + read test (creates silver.trino_test table in RustFS)
+kubectl run trino-test --rm -i --restart=Never -n dwh --image=trinodb/trino:480 -- \
+  trino --server http://trino.dwh.svc.cluster.local:8080 \
+        --execute "
+          CREATE TABLE IF NOT EXISTS lakehouse.silver.trino_test
+            (id INTEGER, name VARCHAR, amount DOUBLE)
+          WITH (format='PARQUET');
+          INSERT INTO lakehouse.silver.trino_test VALUES (1,'Alice',99.99),(2,'Bob',149.50);
+          SELECT * FROM lakehouse.silver.trino_test ORDER BY id"
 ```
 
 UI: `http://<node-ip>:30880`
@@ -605,6 +926,99 @@ curl "http://${NODE_IP}:30123/" --data \
   "INSERT INTO default.test VALUES (1,'hello'),(2,'world')"
 curl "http://${NODE_IP}:30123/" --data \
   "SELECT * FROM default.test"
+```
+
+---
+
+## Backup and Restore
+
+Scripts in `backup/`. No extra tools required — uses `kubectl exec` and ClickHouse native SQL.
+
+### Directory layout
+
+```
+backup/
+├── pg-backup.sh    ← PostgreSQL: pg_dump via kubectl exec → local .dump file
+├── pg-restore.sh   ← PostgreSQL: pg_restore streamed into primary pod
+├── ch-backup.sh    ← ClickHouse: BACKUP DATABASE ... TO S3 (RustFS)
+├── ch-restore.sh   ← ClickHouse: RESTORE DATABASE ... FROM S3 (RustFS) + list
+└── dumps/          ← PostgreSQL dump files (created on first backup)
+```
+
+### PostgreSQL backup
+
+```bash
+# Backup 'polaris' database (default)
+./backup/pg-backup.sh
+
+# Backup a specific database
+./backup/pg-backup.sh superset
+
+# Backup all user databases
+./backup/pg-backup.sh all
+
+# Backup to a custom directory
+./backup/pg-backup.sh polaris /mnt/nfs/pg-backups
+```
+
+Output: `backup/dumps/pg-<database>-<YYYYMMDD-HHMMSS>.dump` (compressed custom format, ~20 KB for Polaris metadata)
+
+### PostgreSQL restore
+
+```bash
+# List available dumps
+ls backup/dumps/
+
+# Restore to the same database name (asks for confirmation — drops existing data)
+./backup/pg-restore.sh backup/dumps/pg-polaris-20260511-110320.dump
+
+# Restore to a different database (safe — original stays intact)
+./backup/pg-restore.sh backup/dumps/pg-polaris-20260511-110320.dump polaris_test
+```
+
+> Uses `kubectl exec -c postgres` peer auth (postgres OS user → postgres superuser).
+> No password needed, works even with `enableSuperuserAccess: false`.
+
+### ClickHouse backup
+
+Backs up directly to RustFS S3 at `s3://lakehouse/ch-backups/<database>/<timestamp>/`.
+
+```bash
+# Backup 'default' database
+./backup/ch-backup.sh
+
+# Backup specific database
+./backup/ch-backup.sh mydb
+
+# Backup all user databases
+./backup/ch-backup.sh all
+```
+
+### ClickHouse restore
+
+```bash
+# List available backups (reads from system.backups)
+./backup/ch-restore.sh
+
+# Restore 'default' from a specific timestamp (drops and recreates the database)
+./backup/ch-restore.sh default 20260511-110326
+
+# Restore into a different name (keeps original intact)
+./backup/ch-restore.sh default 20260511-110326 default_restored
+```
+
+### Schedule daily backups (cron)
+
+```bash
+# Edit crontab
+crontab -e
+
+# Add these lines:
+# PostgreSQL — daily at 02:00
+0 2 * * * cd /home/nik/projects/k3s/dwh && ./backup/pg-backup.sh all >> /tmp/pg-backup.log 2>&1
+
+# ClickHouse — daily at 03:00
+0 3 * * * cd /home/nik/projects/k3s/dwh && ./backup/ch-backup.sh all >> /tmp/ch-backup.log 2>&1
 ```
 
 ---
@@ -643,7 +1057,8 @@ curl $H http://localhost:30181/api/catalog/v1/lakehouse/namespaces/bronze/tables
 | Service | Credential |
 |---|---|
 | Polaris | `client_id=root`, `client_secret=s3cr3t`, `realm=POLARIS` |
-| Ozone S3 | `access-key=ozone`, `secret-key=ozone-secret123` |
+| RustFS S3 (active) | `access-key=lakehouseadmin`, `secret-key=Lk@h0use-S3-2026!` |
+| Ozone S3 (alternate) | `access-key=ozone`, `secret-key=ozone-secret123` |
 | Airflow UI | `admin` / `admin` |
 | ClickHouse | user `default`, no password (also `operator` user, see secret `clickhouse-clickhouse`) |
 | Trino | user `trino`, no password |
@@ -681,7 +1096,9 @@ kubectl logs -n dwh -l app.kubernetes.io/component=om -f
 | `helm install` fails with "chart not found" on Polaris | Add `--version 1.3.0-incubating` — Helm won't auto-resolve pre-release versions |
 | Polaris bootstrap fails with wrong user | Never use `USERNAME` bash var — use `DB_USER` instead |
 | PyIceberg `Credential vending was requested but no credentials are available` | Add `"header.X-Iceberg-Access-Delegation": ""` to catalog config (suppresses delegation) |
-| Polaris S3 writes going to real AWS (301 redirect) | Set `AWS_ENDPOINT_URL_S3` env var on Polaris pod — `s3.endpoint` in storageConfigInfo is ignored |
+| Polaris S3 writes going to real AWS (301 redirect) | Set `AWS_ENDPOINT_URL_S3` env var on Polaris pod — `s3.endpoint` in storageConfigInfo is silently ignored |
+| RustFS `access_key` validation failure during helm install | Chart rejects default `rustfsadmin` and empty keys — use a custom key (e.g. `lakehouseadmin`) |
+| RustFS S3 ingress routes to console (9001) instead of S3 API (9000) | Chart bug: patch after install — `kubectl -n dwh patch ingress rustfs --type=json -p='[{"op":"replace","path":"/spec/rules/0/http/paths/0/backend/service/port/name","value":"endpoint"}]'` |
 | Ozone `getsecret` fails (Kerberos error) | Use static credentials — Ozone S3G in non-secure mode accepts any key/secret |
 | Trino property errors on version 480 | See [Trino 480 Property Renames](#trino-480-property-renames) below |
 | ClickHouseCluster `unknown field keeperClusterRef.namespace` | Remove `namespace` from `keeperClusterRef` — same-namespace only |
@@ -710,5 +1127,8 @@ Trino 480 renamed several catalog properties. Old → New:
 ## Reset
 
 ```bash
-./uninstall.sh && ./install.sh --with-ozone --with-trino --with-clickhouse --with-cloudbeaver --no-spark --no-airflow
+./uninstall.sh && ./install.sh --with-trino --with-clickhouse --with-cloudbeaver --no-spark --no-airflow
 ```
+
+> `--with-ozone` is not needed when using RustFS. RustFS is deployed manually via Helm
+> (see Step 5) because it needs the TLS secret and credentials secret created first.
